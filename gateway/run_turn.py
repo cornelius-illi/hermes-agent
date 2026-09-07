@@ -24,7 +24,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
-    SessionSource, _session_key_namespace, build_channel_continuity_note,
+    SessionContext, SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
@@ -3571,13 +3571,36 @@ class GatewayTurnMixin:
         # guard will consult. Fail-safe in helper.
         await self._refresh_agent_cache_message_count(session_key, session_id)
 
-        followup_result = await self._run_agent(
+        followup_kwargs = dict(
             message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, inbound_message_id=next_inbound_id,
             channel_prompt=next_channel_prompt, message_type=next_message_type,
         )
+        if pending_event is None:
+            followup_result = await self._run_agent(**followup_kwargs)
+        else:
+            # The follow-up is another inbound message, possibly from another sender of a shared
+            # thread: bind ITS session identity (HERMES_SESSION_USER_ID etc.) for the tools, hooks
+            # and approval requester of that turn. The session vars were bound once for the first
+            # message (_hmwa_prepare_turn) and are not nestable, so run the follow-up in a child
+            # task: its context copy takes the new binding while the outer turn's stays intact.
+            async def _run_followup_with_own_identity():
+                # _set_session_env reads only source + session_key (see gateway/run.py).
+                followup_ctx = SessionContext(
+                    source=next_source, connected_platforms=[], home_channels={},
+                    session_key=next_session_key or "", session_id=session_id or "",
+                )
+                self._set_session_env(followup_ctx)
+                return await self._run_agent(**followup_kwargs)
+
+            followup_task = asyncio.create_task(_run_followup_with_own_identity())
+            try:
+                followup_result = await followup_task
+            except asyncio.CancelledError:
+                followup_task.cancel()  # keep the same-task semantics: cancelling the turn cancels its follow-up
+                raise
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

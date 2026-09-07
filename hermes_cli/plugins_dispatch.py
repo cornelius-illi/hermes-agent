@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import contextvars
 import copy
-import inspect
 import logging
 import queue
 import re
@@ -18,7 +17,7 @@ import types
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
-from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
+from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, invoke_with_declared_kwargs
 
 logger = logging.getLogger("hermes_cli.plugins")
 
@@ -157,17 +156,7 @@ class PluginDispatchMixin:
         plugin's body never runs (#12449).
         """
         from hermes_cli.plugins import resolve_plugin_command_result
-        try:
-            parameters = inspect.signature(callback).parameters
-        except (TypeError, ValueError):
-            return resolve_plugin_command_result(callback(**payload))  # no introspectable signature
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-            return resolve_plugin_command_result(callback(**payload))
-        keyword_kinds = {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
-        return resolve_plugin_command_result(callback(**{
-            name: value for name, value in payload.items()
-            if name in parameters and parameters[name].kind in keyword_kinds
-        }))
+        return resolve_plugin_command_result(invoke_with_declared_kwargs(callback, payload))
 
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
@@ -466,7 +455,7 @@ class PluginDispatchMixin:
         results: List[Any] = []
         for cb in self._middleware.get(kind, []):
             try:
-                ret = cb(**kwargs)
+                ret = invoke_with_declared_kwargs(cb, kwargs)  # additive payloads, as for hooks
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
